@@ -1,8 +1,8 @@
 import sys
 import os
 import json
-import ctypes
-from ctypes import wintypes
+import platform
+import subprocess
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
     QLabel, QPushButton, QColorDialog, QComboBox, QSlider, QGroupBox,
@@ -14,125 +14,186 @@ from PyQt5.QtCore import Qt, QPoint
 CONFIG_FILE = "crosshair_config.json"
 MONITOR_CONFIG_FILE = "monitor_config.json"
 
-# Configurações para acesso à API do Windows
-user32 = ctypes.windll.user32
-gdi32 = ctypes.windll.gdi32
-
-class WindowsMonitorControl:
+class MonitorControl:
+    @staticmethod
+    def get_os():
+        """Retorna o sistema operacional atual"""
+        return platform.system()
+    
     @staticmethod
     def set_brightness(value):
-        """Define o brilho do monitor usando a API do Windows"""
+        """Define o brilho do monitor"""
+        os_type = MonitorControl.get_os()
         try:
-            # Tenta usar a API do Windows para ajustar o brilho
-            hdc = user32.GetDC(0)
-            gamma_ramp = WindowsMonitorControl._create_gamma_ramp(value / 100)
-            success = gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(gamma_ramp))
-            user32.ReleaseDC(0, hdc)
-            return bool(success)
+            if os_type == "Windows":
+                # Para Windows, tentamos usar métodos alternativos
+                MonitorControl._set_brightness_windows(value)
+            elif os_type == "Linux":
+                MonitorControl._set_brightness_linux(value)
+            elif os_type == "Darwin":  # macOS
+                MonitorControl._set_brightness_macos(value)
+            return True
         except Exception as e:
             print(f"Erro ao ajustar brilho: {e}")
             return False
-
+    
     @staticmethod
-    def _create_gamma_ramp(brightness_factor):
-        """Cria uma rampa gamma para ajustar o brilho"""
-        class GammaRamp(ctypes.Structure):
-            _fields_ = [('red', (wintypes.WORD * 256)),
-                       ('green', (wintypes.WORD * 256)),
-                       ('blue', (wintypes.WORD * 256))]
-        
-        ramp = GammaRamp()
-        
-        for i in range(256):
-            # Ajusta cada componente de cor com o fator de brilho
-            ramp.red[i] = int(min(65535, max(0, i * 257 * brightness_factor)))
-            ramp.green[i] = int(min(65535, max(0, i * 257 * brightness_factor)))
-            ramp.blue[i] = int(min(65535, max(0, i * 257 * brightness_factor)))
-        
-        return ramp
-
-    @staticmethod
-    def set_high_contrast_mode(enabled):
-        """Ativa/desativa o modo de alto contraste do Windows"""
+    def _set_brightness_windows(value):
+        """Define brilho no Windows"""
         try:
-            if enabled:
-                # Configurações de alto contraste (preto no branco)
-                os.system('reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes" /v CurrentTheme /t REG_EXPAND_SZ /d "" /f')
-                os.system('reg add "HKCU\\Control Panel\\Colors" /v Window /t REG_SZ /d "255 255 255" /f')
-                os.system('reg add "HKCU\\Control Panel\\Colors" /v WindowText /t REG_SZ /d "0 0 0" /f')
-                os.system('reg add "HKCU\\Control Panel\\Colors" /v Highlight /t REG_SZ /d "0 0 255" /f')
-                os.system('reg add "HKCU\\Control Panel\\Colors" /v HighlightText /t REG_SZ /d "255 255 255" /f')
-            else:
-                # Restaura as configurações padrão
-                os.system('reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes" /v CurrentTheme /f')
-                os.system('reg delete "HKCU\\Control Panel\\Colors" /v Window /f')
-                os.system('reg delete "HKCU\\Control Panel\\Colors" /v WindowText /f')
-                os.system('reg delete "HKCU\\Control Panel\\Colors" /v Highlight /f')
-                os.system('reg delete "HKCU\\Control Panel\\Colors" /v HighlightText /f')
+            # Método 1: Usando PowerShell
+            brightness = max(0, min(100, value))
+            ps_command = f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,{brightness})"
+            subprocess.run(["powershell", "-Command", ps_command], capture_output=True)
+        except:
+            try:
+                # Método 2: Usando utility externa (se disponível)
+                subprocess.run(["nircmd.exe", "setbrightness", str(value)], capture_output=True)
+            except:
+                # Método 3: Mensagem para usuário
+                print("No Windows, ajuste o brilho manualmente pelas configurações de display")
+    
+    @staticmethod
+    def _set_brightness_linux(value):
+        """Define brilho no Linux"""
+        try:
+            # Tenta encontrar a interface de brilho
+            brightness_path = None
+            possible_paths = [
+                "/sys/class/backlight/intel_backlight/brightness",
+                "/sys/class/backlight/acpi_video0/brightness",
+                "/sys/class/backlight/nvidia_backlight/brightness",
+                "/sys/class/backlight/amdgpu_bl0/brightness",
+                "/sys/class/backlight/radeon_bl0/brightness"
+            ]
             
-            # Força a atualização do sistema
-            user32.SystemParametersInfoW(0x0015, 0, None, 0)  # SPI_SETWORKAREA
+            for path in possible_paths:
+                if os.path.exists(path):
+                    brightness_path = path
+                    break
+            
+            if brightness_path:
+                # Encontra o valor máximo de brilho
+                max_brightness_path = brightness_path.replace("brightness", "max_brightness")
+                if os.path.exists(max_brightness_path):
+                    with open(max_brightness_path, 'r') as f:
+                        max_brightness = int(f.read().strip())
+                    
+                    # Calcula o valor absoluto baseado na porcentagem
+                    absolute_value = int((value / 100) * max_brightness)
+                    
+                    # Escreve o valor (precisa de permissões sudo)
+                    try:
+                        with open(brightness_path, 'w') as f:
+                            f.write(str(absolute_value))
+                    except PermissionError:
+                        # Se não tiver permissão, usa xrandr como fallback
+                        display = MonitorControl._get_display_name_linux()
+                        brightness = value / 100
+                        subprocess.run(['xrandr', '--output', display, '--brightness', str(brightness)], 
+                                      capture_output=True)
+            else:
+                # Fallback para xrandr (ajusta gamma, não brilho real)
+                display = MonitorControl._get_display_name_linux()
+                brightness = max(0.1, min(3.0, value / 50))  # Converter para escala do xrandr
+                subprocess.run(['xrandr', '--output', display, '--brightness', str(brightness)], 
+                              capture_output=True)
+        except Exception as e:
+            print(f"Erro ao ajustar brilho no Linux: {e}")
+    
+    @staticmethod
+    def _set_brightness_macos(value):
+        """Define brilho no macOS"""
+        try:
+            brightness = max(0, min(100, value))
+            script = f'''
+            tell application "System Events"
+                set brightness to {brightness / 100}
+            end tell
+            '''
+            subprocess.run(['osascript', '-e', script], capture_output=True)
+        except:
+            print("Não foi possível ajustar o brilho no macOS")
+    
+    @staticmethod
+    def _get_display_name_linux():
+        """Obtém o nome do display no Linux"""
+        try:
+            result = subprocess.run(['xrandr', '--query'], capture_output=True, text=True)
+            lines = result.stdout.split('\n')
+            for line in lines:
+                if ' connected' in line:
+                    return line.split()[0]
+        except:
+            pass
+        return "eDP-1"  # Valor padrão comum
+    
+    @staticmethod
+    def set_contrast(value):
+        """Define o contraste do monitor"""
+        os_type = MonitorControl.get_os()
+        try:
+            if os_type == "Linux":
+                # No Linux, usa xgamma para ajustar contraste
+                gamma = 1.0 + (value - 50) / 100  # Converter para escala do gamma
+                subprocess.run(['xgamma', '-gamma', str(gamma)], capture_output=True)
+            else:
+                # Windows/macOS - mensagem informativa
+                print(f"Ajuste o contraste para {value}% manualmente nas configurações do monitor")
             return True
         except Exception as e:
             print(f"Erro ao ajustar contraste: {e}")
             return False
-
+    
     @staticmethod
-    def set_night_light(enabled, intensity=80):
-        """Configura o modo noturno/luz noturna do Windows"""
+    def set_night_mode(enabled):
+        """Ativa/desativa o modo noturno"""
+        os_type = MonitorControl.get_os()
         try:
-            if enabled:
-                # Ativa o modo noturno com intensidade especificada
-                os.system(f'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default$windows.data.bluelightreduction.bluelightreductionstate" /v Data /t REG_BINARY /d "02{intensity:02x}0000000000" /f')
-            else:
-                # Desativa o modo noturno
-                os.system('reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default$windows.data.bluelightreduction.bluelightreductionstate" /v Data /t REG_BINARY /d "0200000000000000" /f')
-            
+            if os_type == "Linux":
+                if enabled:
+                    subprocess.run(['redshift', '-O', '4500'], capture_output=True)
+                else:
+                    subprocess.run(['redshift', '-x'], capture_output=True)
+            elif os_type == "Windows":
+                if enabled:
+                    subprocess.run(['reg', 'add', 
+                                   'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default$windows.data.bluelightreduction.bluelightreductionstate', 
+                                   '/v', 'Data', '/t', 'REG_BINARY', '/d', '0250000000000000', '/f'], 
+                                  capture_output=True)
+                else:
+                    subprocess.run(['reg', 'add', 
+                                   'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default$windows.data.bluelightreduction.bluelightreductionstate', 
+                                   '/v', 'Data', '/t', 'REG_BINARY', '/d', '0200000000000000', '/f'], 
+                                  capture_output=True)
+            elif os_type == "Darwin":
+                if enabled:
+                    subprocess.run(['osascript', '-e', 
+                                  'tell application "System Events" to tell appearance preferences to set dark mode to true'], 
+                                  capture_output=True)
+                else:
+                    subprocess.run(['osascript', '-e', 
+                                  'tell application "System Events" to tell appearance preferences to set dark mode to false'], 
+                                  capture_output=True)
             return True
         except Exception as e:
             print(f"Erro ao ajustar modo noturno: {e}")
             return False
-
+    
     @staticmethod
-    def set_color_profile(profile_type):
-        """Aplica um perfil de cor pré-definido"""
+    def set_gamma(value):
+        """Ajusta o gamma da tela"""
+        os_type = MonitorControl.get_os()
         try:
-            if profile_type == "vibrant":
-                # Perfil vibrante - cores saturadas
-                for i in range(256):
-                    # Aumenta a saturação das cores
-                    pass  # Implementação simplificada
-            elif profile_type == "night_vision":
-                # Perfil para visão noturna - verde intenso
-                hdc = user32.GetDC(0)
-                ramp = WindowsMonitorControl._create_night_vision_ramp()
-                success = gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
-                user32.ReleaseDC(0, hdc)
-                return bool(success)
-            
+            if os_type == "Linux":
+                gamma = value / 50  # Converter para escala do xgamma
+                subprocess.run(['xgamma', '-gamma', str(gamma)], capture_output=True)
+            else:
+                print(f"Ajuste gamma para {value}% manualmente se disponível")
             return True
         except Exception as e:
-            print(f"Erro ao ajustar perfil de cor: {e}")
+            print(f"Erro ao ajustar gamma: {e}")
             return False
-
-    @staticmethod
-    def _create_night_vision_ramp():
-        """Cria uma rampa gamma para modo de visão noturna (verde)"""
-        class GammaRamp(ctypes.Structure):
-            _fields_ = [('red', (wintypes.WORD * 256)),
-                       ('green', (wintypes.WORD * 256)),
-                       ('blue', (wintypes.WORD * 256))]
-        
-        ramp = GammaRamp()
-        
-        for i in range(256):
-            # Reduz vermelho e azul, mantém verde
-            ramp.red[i] = int(i * 100)  # Vermelho reduzido
-            ramp.green[i] = int(i * 257 * 1.5)  # Verde intensificado
-            ramp.blue[i] = int(i * 100)  # Azul reduzido
-        
-        return ramp
-
 
 class Crosshair(QWidget):
     def __init__(self, config):
@@ -207,87 +268,107 @@ class SettingsWindow(QWidget):
         super().__init__()
         self.crosshair_widget = crosshair_widget
         self.monitor_config = load_monitor_config()
-        self.setWindowTitle("Mira + Controles de Monitor - Visibilidade Noturna")
-        self.setWindowIcon(QIcon("icon.ico"))
+        self.setWindowTitle("Mira Personalizada • Multiplataforma")
         self.setFixedSize(600, 700)
         self.set_dark_theme()
         self.init_ui()
+        
+        # Mostrar informações do sistema
+        self.show_system_info()
+
+    def show_system_info(self):
+        """Mostra informações do sistema operacional"""
+        os_name = platform.system()
+        os_info = f"Sistema: {os_name}"
+        if os_name == "Linux":
+            try:
+                distro = platform.freedesktop_os_release().get('PRETTY_NAME', 'Linux')
+                os_info = f"Sistema: {distro}"
+            except:
+                pass
+        print(os_info)
 
     def init_ui(self):
         layout = QVBoxLayout()
         
+        # Título com informação do OS
+        os_name = platform.system()
+        title_label = QLabel(f"Mira Personalizada - {os_name}")
+        title_label.setStyleSheet("color: #aa55ff; font-weight: bold; font-size: 16px;")
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
         # Criar abas
         tabs = QTabWidget()
         
-        # Aba de Controles de Monitor (PRINCIPAL)
+        # Aba de Controles de Monitor
         monitor_tab = QWidget()
         monitor_layout = QVBoxLayout()
         monitor_tab.setLayout(monitor_layout)
         
+        # Informações do sistema
+        info_label = QLabel(self.get_os_specific_info())
+        info_label.setStyleSheet("color: #ff7700; background-color: #222; padding: 5px;")
+        info_label.setWordWrap(True)
+        monitor_layout.addWidget(info_label)
+        
         # Grupo de controles de brilho
-        brightness_group = QGroupBox("CONTROLES DE BRILHO (Máxima Visibilidade)")
-        brightness_group.setStyleSheet("QGroupBox { color: yellow; font-weight: bold; border: 2px solid yellow; }")
+        brightness_group = QGroupBox("CONTROLES DE BRILHO")
+        brightness_group.setStyleSheet("QGroupBox { color: yellow; font-weight: bold; }")
         brightness_layout = QVBoxLayout()
         
         self.brightness_slider = self._create_monitor_slider(brightness_layout, "BRILHO", 0, 100, 
-                                                           self.monitor_config.get("brightness", 80),
+                                                           self.monitor_config.get("brightness", 50),
                                                            self.apply_brightness)
         brightness_group.setLayout(brightness_layout)
         monitor_layout.addWidget(brightness_group)
         
         # Grupo de controles de contraste
-        contrast_group = QGroupBox("CONTROLES DE CONTRASTE (Melhor Detecção)")
-        contrast_group.setStyleSheet("QGroupBox { color: cyan; font-weight: bold; border: 2px solid cyan; }")
+        contrast_group = QGroupBox("CONTROLES DE CONTRASTE")
+        contrast_group.setStyleSheet("QGroupBox { color: cyan; font-weight: bold; }")
         contrast_layout = QVBoxLayout()
         
         self.contrast_slider = self._create_monitor_slider(contrast_layout, "CONTRASTE", 0, 100,
-                                                         self.monitor_config.get("contrast", 80),
+                                                         self.monitor_config.get("contrast", 50),
                                                          self.apply_contrast)
         contrast_group.setLayout(contrast_layout)
         monitor_layout.addWidget(contrast_group)
         
-        # Modos especiais
-        special_modes_group = QGroupBox("MODOS ESPECIAIS (Visibilidade Noturna)")
-        special_modes_group.setStyleSheet("QGroupBox { color: #ff7700; font-weight: bold; border: 2px solid #ff7700; }")
-        special_modes_layout = QVBoxLayout()
+        # Grupo de controles de gamma
+        gamma_group = QGroupBox("CONTROLES DE GAMMA")
+        gamma_group.setStyleSheet("QGroupBox { color: #ff77ff; font-weight: bold; }")
+        gamma_layout = QVBoxLayout()
         
-        # Modo de alto contraste
-        self.high_contrast_checkbox = QCheckBox("MÁXIMO CONTRASTE (Preto/Branco)")
-        self.high_contrast_checkbox.setChecked(self.monitor_config.get("high_contrast", False))
-        self.high_contrast_checkbox.stateChanged.connect(self.toggle_high_contrast)
-        special_modes_layout.addWidget(self.high_contrast_checkbox)
+        self.gamma_slider = self._create_monitor_slider(gamma_layout, "GAMMA", 0, 100,
+                                                      self.monitor_config.get("gamma", 50),
+                                                      self.apply_gamma)
+        gamma_group.setLayout(gamma_layout)
+        monitor_layout.addWidget(gamma_group)
         
-        # Modo visão noturna
-        self.night_vision_checkbox = QCheckBox("VISÃO NOTURNA (Ênfase em Verde)")
-        self.night_vision_checkbox.setChecked(self.monitor_config.get("night_vision", False))
-        self.night_vision_checkbox.stateChanged.connect(self.toggle_night_vision)
-        special_modes_layout.addWidget(self.night_vision_checkbox)
+        # Modo noturno
+        night_mode_group = QGroupBox("MODO NOTURNO")
+        night_mode_group.setStyleSheet("QGroupBox { color: #ff7700; font-weight: bold; }")
+        night_mode_layout = QVBoxLayout()
         
-        # Modo noturno (luz azul)
-        self.night_light_checkbox = QCheckBox("LUZ NOTURNA (Reduzir Luz Azul)")
-        self.night_light_checkbox.setChecked(self.monitor_config.get("night_light", False))
-        self.night_light_checkbox.stateChanged.connect(self.toggle_night_light)
-        special_modes_layout.addWidget(self.night_light_checkbox)
+        self.night_mode_checkbox = QCheckBox("Ativar Modo Noturno (Reduz Luz Azul)")
+        self.night_mode_checkbox.setChecked(self.monitor_config.get("night_mode", False))
+        self.night_mode_checkbox.stateChanged.connect(self.toggle_night_mode)
+        night_mode_layout.addWidget(self.night_mode_checkbox)
         
-        special_modes_group.setLayout(special_modes_layout)
-        monitor_layout.addWidget(special_modes_group)
+        night_mode_group.setLayout(night_mode_layout)
+        monitor_layout.addWidget(night_mode_group)
         
         # Botões de preset
         preset_group = QGroupBox("PRESETS RÁPIDOS")
-        preset_group.setStyleSheet("QGroupBox { color: #aa55ff; font-weight: bold; border: 2px solid #aa55ff; }")
+        preset_group.setStyleSheet("QGroupBox { color: #aa55ff; font-weight: bold; }")
         preset_layout = QHBoxLayout()
         
-        night_preset_btn = QPushButton("PRESET NOITE (Recomendado)")
-        night_preset_btn.setStyleSheet("QPushButton { background-color: #aa55ff; color: white; font-weight: bold; }")
+        night_preset_btn = QPushButton("Preset Noite")
+        night_preset_btn.setStyleSheet("QPushButton { background-color: #aa55ff; color: white; }")
         night_preset_btn.clicked.connect(self.apply_night_preset)
         preset_layout.addWidget(night_preset_btn)
         
-        extreme_preset_btn = QPushButton("MÁXIMA VISIBILIDADE")
-        extreme_preset_btn.setStyleSheet("QPushButton { background-color: red; color: white; font-weight: bold; }")
-        extreme_preset_btn.clicked.connect(self.apply_extreme_preset)
-        preset_layout.addWidget(extreme_preset_btn)
-        
-        default_preset_btn = QPushButton("PADRÃO")
+        default_preset_btn = QPushButton("Padrão")
         default_preset_btn.setStyleSheet("QPushButton { background-color: #333; color: white; }")
         default_preset_btn.clicked.connect(self.apply_default_preset)
         preset_layout.addWidget(default_preset_btn)
@@ -295,15 +376,9 @@ class SettingsWindow(QWidget):
         preset_group.setLayout(preset_layout)
         monitor_layout.addWidget(preset_group)
         
-        # Aviso
-        warning_label = QLabel("AVISO: Estas configurações podem deixar as cores exageradas, mas melhoram a visibilidade noturna!")
-        warning_label.setStyleSheet("color: red; font-weight: bold; background-color: black; padding: 5px;")
-        warning_label.setWordWrap(True)
-        monitor_layout.addWidget(warning_label)
+        tabs.addTab(monitor_tab, "Monitor")
         
-        tabs.addTab(monitor_tab, "MONITOR (Principal)")
-        
-        # Aba da Mira (secundária)
+        # Aba da Mira
         crosshair_tab = QWidget()
         crosshair_layout = QVBoxLayout()
         crosshair_tab.setLayout(crosshair_layout)
@@ -343,6 +418,18 @@ class SettingsWindow(QWidget):
         # Aplicar configurações iniciais
         self.apply_monitor_settings()
 
+    def get_os_specific_info(self):
+        """Retorna informações específicas do sistema operacional"""
+        os_name = platform.system()
+        if os_name == "Linux":
+            return "Linux: Use os controles deslizantes para ajustar brilho, contraste e gamma. Certifique-se de ter xgamma e xrandr instalados."
+        elif os_name == "Windows":
+            return "Windows: Alguns controles podem requerer ajuste manual nas configurações de display."
+        elif os_name == "Darwin":
+            return "macOS: Controles funcionam via AppleScript. Pode precisar de permissões."
+        else:
+            return f"{os_name}: Controles podem ter funcionalidade limitada."
+
     def _create_slider(self, layout, label_text, min_val, max_val, config_key):
         label = QLabel(label_text)
         label.setStyleSheet("color: white;")
@@ -360,7 +447,7 @@ class SettingsWindow(QWidget):
     
     def _create_monitor_slider(self, layout, label_text, min_val, max_val, default_val, callback):
         label = QLabel(f"{label_text}: {default_val}%")
-        label.setStyleSheet("color: white; font-weight: bold;")
+        label.setStyleSheet("color: white;")
         layout.addWidget(label)
 
         slider = QSlider(Qt.Horizontal)
@@ -397,74 +484,50 @@ class SettingsWindow(QWidget):
     
     def apply_brightness(self, value):
         self.monitor_config["brightness"] = value
-        WindowsMonitorControl.set_brightness(value/100)
+        MonitorControl.set_brightness(value)
         self.save_monitor_config()
     
     def apply_contrast(self, value):
         self.monitor_config["contrast"] = value
-        # Para Windows, usamos o modo de alto contraste como alternativa
-        if value > 80:
-            WindowsMonitorControl.set_high_contrast_mode(True)
+        MonitorControl.set_contrast(value)
         self.save_monitor_config()
     
-    def toggle_high_contrast(self, state):
-        enabled = state == Qt.Checked
-        self.monitor_config["high_contrast"] = enabled
-        WindowsMonitorControl.set_high_contrast_mode(enabled)
+    def apply_gamma(self, value):
+        self.monitor_config["gamma"] = value
+        MonitorControl.set_gamma(value)
         self.save_monitor_config()
     
-    def toggle_night_vision(self, state):
+    def toggle_night_mode(self, state):
         enabled = state == Qt.Checked
-        self.monitor_config["night_vision"] = enabled
-        if enabled:
-            WindowsMonitorControl.set_color_profile("night_vision")
-            # Desativa outros modos
-            self.night_light_checkbox.setChecked(False)
-            self.high_contrast_checkbox.setChecked(False)
-        self.save_monitor_config()
-    
-    def toggle_night_light(self, state):
-        enabled = state == Qt.Checked
-        self.monitor_config["night_light"] = enabled
-        WindowsMonitorControl.set_night_light(enabled, 80)
+        self.monitor_config["night_mode"] = enabled
+        MonitorControl.set_night_mode(enabled)
         self.save_monitor_config()
     
     def apply_night_preset(self):
         """Preset recomendado para jogos noturnos"""
-        self.brightness_slider.setValue(85)
-        self.contrast_slider.setValue(90)
-        self.night_vision_checkbox.setChecked(True)
-        self.night_light_checkbox.setChecked(True)
-        self.high_contrast_checkbox.setChecked(False)
-    
-    def apply_extreme_preset(self):
-        """Preset de máxima visibilidade (cores exageradas)"""
-        self.brightness_slider.setValue(100)
-        self.contrast_slider.setValue(100)
-        self.high_contrast_checkbox.setChecked(True)
-        self.night_vision_checkbox.setChecked(False)
-        self.night_light_checkbox.setChecked(False)
+        self.brightness_slider.setValue(70)
+        self.contrast_slider.setValue(80)
+        self.gamma_slider.setValue(60)
+        self.night_mode_checkbox.setChecked(True)
     
     def apply_default_preset(self):
         """Restaura configurações padrão"""
         self.brightness_slider.setValue(50)
         self.contrast_slider.setValue(50)
-        self.high_contrast_checkbox.setChecked(False)
-        self.night_vision_checkbox.setChecked(False)
-        self.night_light_checkbox.setChecked(False)
-        WindowsMonitorControl.set_high_contrast_mode(False)
-        WindowsMonitorControl.set_night_light(False)
-        WindowsMonitorControl.set_brightness(0.5)
+        self.gamma_slider.setValue(50)
+        self.night_mode_checkbox.setChecked(False)
+        # Aplicar as configurações
+        self.apply_brightness(50)
+        self.apply_contrast(50)
+        self.apply_gamma(50)
+        MonitorControl.set_night_mode(False)
     
     def apply_monitor_settings(self):
         # Aplicar configurações salvas ao iniciar
-        WindowsMonitorControl.set_brightness(self.monitor_config.get("brightness", 80)/100)
-        if self.monitor_config.get("high_contrast", False):
-            WindowsMonitorControl.set_high_contrast_mode(True)
-        if self.monitor_config.get("night_light", False):
-            WindowsMonitorControl.set_night_light(True, 80)
-        if self.monitor_config.get("night_vision", False):
-            WindowsMonitorControl.set_color_profile("night_vision")
+        MonitorControl.set_brightness(self.monitor_config.get("brightness", 50))
+        MonitorControl.set_contrast(self.monitor_config.get("contrast", 50))
+        MonitorControl.set_gamma(self.monitor_config.get("gamma", 50))
+        MonitorControl.set_night_mode(self.monitor_config.get("night_mode", False))
 
     def save_crosshair_config(self):
         with open(CONFIG_FILE, "w") as f:
@@ -475,17 +538,30 @@ class SettingsWindow(QWidget):
             json.dump(self.monitor_config, f, indent=4)
 
     def open_about(self):
-        QMessageBox.information(self, "Sobre", 
-            "Mira Overlay com Controles de Monitor para Windows\n\n"
-            "Foco em máxima visibilidade para jogos noturnos\n\n"
-            "RECOMENDAÇÕES:\n"
-            "- Use o 'PRESET NOITE' para melhor visibilidade\n"
-            "- 'MÁXIMA VISIBILIDADE' para situações extremas\n"
-            "- As cores podem ficar exageradas mas melhoram a detecção\n\n"
-            "Desenvolvido para funcionar no Windows 7/10/11")
+        os_name = platform.system()
+        message = f"""
+        Mira Overlay com Controles de Monitor - Multiplataforma
+        
+        Sistema: {os_name}
+        
+        Funcionalidades:
+        - Mira personalizável para jogos
+        - Controles de brilho, contraste e gamma
+        - Modo noturno para reduzir luz azul
+        - Presets para configurações rápidas
+        
+        Notas:
+        • No Linux: Instale x11-xserver-utils para funcionalidade completa
+        • No Windows: Alguns controles podem precisar de ajuste manual
+        • No macOS: Funcionalidade via AppleScript
+        
+        Desenvolvido para funcionar em Windows, Linux e macOS
+        """
+        
+        QMessageBox.information(self, "Sobre", message)
 
     def set_dark_theme(self):
-        # Tema escuro simples para melhor contraste
+        # Tema escuro simples
         self.setStyleSheet("""
             QWidget {
                 background-color: #222222;
@@ -516,16 +592,9 @@ class SettingsWindow(QWidget):
                 margin: -2px 0;
                 border-radius: 3px;
             }
-            QSlider::sub-page:horizontal {
-                background: #aa55ff;
-            }
             QCheckBox {
                 color: #ffffff;
                 spacing: 5px;
-            }
-            QCheckBox::indicator {
-                width: 15px;
-                height: 15px;
             }
             QCheckBox::indicator:unchecked {
                 border: 1px solid #777777;
@@ -547,7 +616,7 @@ def load_config():
         "gap": 5,
         "thickness": 3,
         "opacity": 100,
-        "color": "#00FF00",  # Verde bem visível
+        "color": "#00FF00",
         "style": "Clássico"
     }
 
@@ -557,20 +626,14 @@ def load_monitor_config():
         with open(MONITOR_CONFIG_FILE, "r") as f:
             return json.load(f)
     return {
-        "brightness": 80,
-        "contrast": 80,
-        "high_contrast": False,
-        "night_vision": False,
-        "night_light": True
+        "brightness": 50,
+        "contrast": 50,
+        "gamma": 50,
+        "night_mode": False
     }
 
 
 if __name__ == "__main__":
-    # Verificar se é Windows
-    if not sys.platform.startswith('win'):
-        QMessageBox.critical(None, "Erro", "Este aplicativo é apenas para Windows!")
-        sys.exit(1)
-    
     app = QApplication(sys.argv)
     config = load_config()
     crosshair = Crosshair(config)
