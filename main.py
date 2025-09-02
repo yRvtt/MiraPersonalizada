@@ -1,645 +1,718 @@
-import sys
-import os
-import json
-import platform
-import subprocess
+# -*- coding: utf-8 -*-
+import sys, os, json, platform, ctypes, subprocess
+from ctypes import wintypes
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
-    QLabel, QPushButton, QColorDialog, QComboBox, QSlider, QGroupBox,
-    QCheckBox, QMessageBox
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QColorDialog, QComboBox, QSlider, QGroupBox, QMessageBox, QFrame,
+    QSizePolicy, QCheckBox
 )
-from PyQt5.QtGui import QPainter, QPen, QColor, QPalette, QFont, QIcon
-from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtGui import QPainter, QPen, QColor
+from PyQt5.QtCore import Qt, QRect, QTimer
 
 CONFIG_FILE = "crosshair_config.json"
-MONITOR_CONFIG_FILE = "monitor_config.json"
 
-class MonitorControl:
-    @staticmethod
-    def get_os():
-        """Retorna o sistema operacional atual"""
-        return platform.system()
-    
-    @staticmethod
-    def set_brightness(value):
-        """Define o brilho do monitor"""
-        os_type = MonitorControl.get_os()
-        try:
-            if os_type == "Windows":
-                # Para Windows, tentamos usar métodos alternativos
-                MonitorControl._set_brightness_windows(value)
-            elif os_type == "Linux":
-                MonitorControl._set_brightness_linux(value)
-            elif os_type == "Darwin":  # macOS
-                MonitorControl._set_brightness_macos(value)
+# ---------------------------
+# Admin (UAC) sempre
+# ---------------------------
+def ensure_admin():
+    if platform.system() != "Windows":
+        return True
+    try:
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        is_admin = False
+    if not is_admin:
+        script = os.path.abspath(sys.argv[0])
+        params = '"' + script + '"'
+        if len(sys.argv) > 1:
+            params += " " + " ".join('"%s"' % a for a in sys.argv[1:])
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        sys.exit(0)
+    return True
+
+def disable_windows_night_light():
+    try:
+        subprocess.run([
+            'reg', 'add',
+            r'HKCU\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default$windows.data.bluelightreduction.bluelightreductionstate',
+            '/v', 'Data', '/t', 'REG_BINARY', '/d', '0200000000000000', '/f'
+        ], capture_output=True)
+        return True
+    except Exception:
+        return False
+
+def is_rdp_session():
+    return os.environ.get('SESSIONNAME', '').upper().startswith('RDP-')
+
+# =========================
+# Win32 / User32
+# =========================
+gdi32  = ctypes.windll.gdi32
+user32 = ctypes.windll.user32
+
+SetWindowPos = user32.SetWindowPos
+SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+SetWindowPos.restype  = wintypes.BOOL
+HWND_TOPMOST = ctypes.c_void_p(-1).value
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+
+GWL_EXSTYLE=-20
+WS_EX_LAYERED=0x00080000
+WS_EX_TRANSPARENT=0x00000020
+WS_EX_NOACTIVATE=0x08000000
+WS_EX_TOOLWINDOW=0x00000080  # não aparece na barra de tarefas
+
+# =========================
+# LUT (Gamma Ramp)
+# =========================
+class GAMMARAMP(ctypes.Structure):
+    _fields_ = [("Red", wintypes.WORD*256), ("Green", wintypes.WORD*256), ("Blue", wintypes.WORD*256)]
+
+class DISPLAY_DEVICEW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD), ("DeviceName", wintypes.WCHAR*32), ("DeviceString", wintypes.WCHAR*128),
+        ("StateFlags", wintypes.DWORD), ("DeviceID", wintypes.WCHAR*128), ("DeviceKey", wintypes.WCHAR*128),
+    ]
+
+DISPLAY_DEVICE_ACTIVE = 0x00000001
+DISPLAY_DEVICE_PRIMARY_DEVICE = 0x00000004
+
+EnumDisplayDevicesW = user32.EnumDisplayDevicesW
+EnumDisplayDevicesW.restype = wintypes.BOOL
+EnumDisplayDevicesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DISPLAY_DEVICEW), wintypes.DWORD]
+
+CreateDCW = gdi32.CreateDCW
+CreateDCW.restype = wintypes.HDC
+CreateDCW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPVOID]
+
+DeleteDC = gdi32.DeleteDC
+DeleteDC.restype = wintypes.BOOL
+DeleteDC.argtypes = [wintypes.HDC]
+
+SetDeviceGammaRamp = gdi32.SetDeviceGammaRamp
+SetDeviceGammaRamp.restype = wintypes.BOOL
+SetDeviceGammaRamp.argtypes = [wintypes.HDC, ctypes.POINTER(GAMMARAMP)]
+
+def _get_primary_display_name():
+    i = 0
+    while True:
+        dd = DISPLAY_DEVICEW(); dd.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+        if not EnumDisplayDevicesW(None, i, ctypes.byref(dd), 0): break
+        if (dd.StateFlags & DISPLAY_DEVICE_ACTIVE) and (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE):
+            return dd.DeviceName
+        i += 1
+    return r"\\.\DISPLAY1"
+
+def _apply_lut_to_primary(ramp):
+    hscr = user32.GetDC(0)
+    try:
+        if bool(SetDeviceGammaRamp(hscr, ctypes.byref(ramp))):
             return True
-        except Exception as e:
-            print(f"Erro ao ajustar brilho: {e}")
-            return False
-    
-    @staticmethod
-    def _set_brightness_windows(value):
-        """Define brilho no Windows"""
+    finally:
+        user32.ReleaseDC(0, hscr)
+    # fallback DC nomeado
+    dev = _get_primary_display_name()
+    hdc = CreateDCW("DISPLAY", dev, None, None)
+    if not hdc: return False
+    try:
+        return bool(SetDeviceGammaRamp(hdc, ctypes.byref(ramp)))
+    finally:
+        DeleteDC(hdc)
+
+# =========================
+# LUT “filtro” (Noite→Dia)
+# =========================
+def _build_lut(bright_pct=84, contr_pct=70, gamma_pct=90, sat_fake_pct=58,
+               daymax=True, clarity=1.2, filter_type="Clarity"):
+    import math
+    B = (bright_pct-50)/100.0
+    C = 0.55 + (contr_pct/100.0)*0.9
+    g_eff = 1.35 - (gamma_pct/100.0)*0.8
+    g_eff = max(0.30, min(3.0, g_eff))
+    S = (sat_fake_pct-50)/50.0
+    S = max(-1.0, min(1.0, S))
+    sat_base = 0.20 * S
+
+    toe_lift         = 0.18*clarity
+    mid_boost        = 0.22*clarity
+    k_hl             = 0.45*clarity
+    sat_shadow_boost = 0.16*clarity
+
+    if filter_type == "NVG Verde":
+        red_warm, green_push, blue_cut = -0.02*clarity, 0.22*clarity, 0.35*clarity
+        sat_extra = -0.05*clarity
+    elif filter_type == "Cinza":
+        red_warm, green_push, blue_cut = 0.0, 0.0, 0.0
+        sat_extra = -0.25*clarity
+    elif filter_type == "Frio (Lua)":
+        red_warm, green_push, blue_cut = -0.06*clarity, 0.06*clarity, 0.12*clarity
+        sat_extra = -0.05*clarity
+    else:
+        red_warm, green_push, blue_cut = 0.03*clarity, 0.07*clarity, 0.12*clarity
+        sat_extra = 0.0
+
+    r=(wintypes.WORD*256)(); g=(wintypes.WORD*256)(); b=(wintypes.WORD*256)()
+    for i in range(256):
+        x = i/255.0
+        x1 = ((x-0.5)*C + 0.5) + B
+        x1 = 0.0 if x1<0.0 else (1.0 if x1>1.0 else x1)
+        y  = pow(x1, 1.0/g_eff)
+        if daymax:
+            y += toe_lift * (1.0 - math.exp(-y/(0.12+0.08*clarity))); y = max(0.0, min(1.0, y))
+            m = (y-0.5); y += mid_boost*m*(1.0-abs(m))*2.0; y = max(0.0, min(1.0, y))
+            y = (y*(1.0+k_hl))/(y+k_hl); y = max(0.0, min(1.0, y))
+        sat_var = sat_base + (sat_shadow_boost*pow(1.0-y,0.8) if daymax else 0.0) + sat_extra
+        xr = y + sat_var*(y-0.5); xg = y + sat_var*(0.5-y); xb = y + sat_var*(xr-xg)*0.5
+        if daymax:
+            xr *= (1.0 + red_warm); xg *= (1.0 + green_push); xb *= (1.0 - blue_cut)
+        xr = max(0.0, min(1.0, xr)); xg = max(0.0, min(1.0, xg)); xb = max(0.0, min(1.0, xb))
+        r[i]=int(xr*65535+0.5); g[i]=int(xg*65535+0.5); b[i]=int(xb*65535+0.5)
+    ramp=GAMMARAMP(); ramp.Red[:]=r[:]; ramp.Green[:]=g[:]; ramp.Blue[:]=b[:]
+    return ramp
+
+# =========================
+# Nativo pass-through (não ativa, não captura)
+# =========================
+WM_NCHITTEST      = 0x0084
+HTTRANSPARENT     = -1
+WM_MOUSEACTIVATE  = 0x0021
+MA_NOACTIVATE     = 3
+
+class POINT(ctypes.Structure):
+    _fields_=[("x", ctypes.c_long), ("y", ctypes.c_long)]
+class MSG(ctypes.Structure):
+    _fields_=[
+        ("hwnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt", POINT)
+    ]
+
+class WinNativePassThrough:
+    # só responde o essencial para nunca ativar/roubar foco
+    def nativeEvent(self, eventType, message):
+        if platform.system()=="Windows" and eventType=="windows_generic_MSG":
+            msg = MSG.from_address(message.__int__())
+            if msg.message == WM_NCHITTEST:
+                return True, ctypes.c_long(HTTRANSPARENT).value
+            if msg.message == WM_MOUSEACTIVATE:
+                return True, MA_NOACTIVATE
+        return False, 0
+
+def _make_click_through(hwnd: int):
+    Get=ctypes.windll.user32.GetWindowLongW
+    Set=ctypes.windll.user32.SetWindowLongW
+    ex=Get(hwnd, GWL_EXSTYLE)
+    ex|=(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW)
+    Set(hwnd, GWL_EXSTYLE, ex)
+    # topmost sem ativar
+    SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW)
+
+# =========================
+# Fullscreen / Rust attach
+# =========================
+MONITOR_DEFAULTTOPRIMARY = 1
+GetForegroundWindow = user32.GetForegroundWindow
+GetWindowRect = user32.GetWindowRect
+MonitorFromWindow = user32.MonitorFromWindow
+GetMonitorInfoW = user32.GetMonitorInfoW
+EnumWindows = user32.EnumWindows
+IsWindowVisible = user32.IsWindowVisible
+GetWindowTextW = user32.GetWindowTextW
+GetWindowTextLengthW = user32.GetWindowTextLengthW
+IsWindow = user32.IsWindow
+
+class MONITORINFO(ctypes.Structure):
+    _fields_=[("cbSize", wintypes.DWORD),
+              ("rcMonitor", wintypes.RECT),
+              ("rcWork", wintypes.RECT),
+              ("dwFlags", wintypes.DWORD)]
+
+WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+def _is_foreground_fullscreen_primary():
+    try:
+        fg = GetForegroundWindow()
+        if not fg: return False
+        rect = wintypes.RECT()
+        if not GetWindowRect(fg, ctypes.byref(rect)): return False
+        mon = MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY)
+        mi = MONITORINFO(); mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not GetMonitorInfoW(mon, ctypes.byref(mi)): return False
+        return (rect.left == mi.rcMonitor.left and rect.top == mi.rcMonitor.top and
+                rect.right == mi.rcMonitor.right and rect.bottom == mi.rcMonitor.bottom)
+    except Exception:
+        return False
+
+def _find_rust_hwnd():
+    found = ctypes.c_void_p(0)
+    def _cb(hwnd, lparam):
         try:
-            # Método 1: Usando PowerShell
-            brightness = max(0, min(100, value))
-            ps_command = f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,{brightness})"
-            subprocess.run(["powershell", "-Command", ps_command], capture_output=True)
-        except:
-            try:
-                # Método 2: Usando utility externa (se disponível)
-                subprocess.run(["nircmd.exe", "setbrightness", str(value)], capture_output=True)
-            except:
-                # Método 3: Mensagem para usuário
-                print("No Windows, ajuste o brilho manualmente pelas configurações de display")
-    
-    @staticmethod
-    def _set_brightness_linux(value):
-        """Define brilho no Linux"""
-        try:
-            # Tenta encontrar a interface de brilho
-            brightness_path = None
-            possible_paths = [
-                "/sys/class/backlight/intel_backlight/brightness",
-                "/sys/class/backlight/acpi_video0/brightness",
-                "/sys/class/backlight/nvidia_backlight/brightness",
-                "/sys/class/backlight/amdgpu_bl0/brightness",
-                "/sys/class/backlight/radeon_bl0/brightness"
-            ]
-            
-            for path in possible_paths:
-                if os.path.exists(path):
-                    brightness_path = path
-                    break
-            
-            if brightness_path:
-                # Encontra o valor máximo de brilho
-                max_brightness_path = brightness_path.replace("brightness", "max_brightness")
-                if os.path.exists(max_brightness_path):
-                    with open(max_brightness_path, 'r') as f:
-                        max_brightness = int(f.read().strip())
-                    
-                    # Calcula o valor absoluto baseado na porcentagem
-                    absolute_value = int((value / 100) * max_brightness)
-                    
-                    # Escreve o valor (precisa de permissões sudo)
-                    try:
-                        with open(brightness_path, 'w') as f:
-                            f.write(str(absolute_value))
-                    except PermissionError:
-                        # Se não tiver permissão, usa xrandr como fallback
-                        display = MonitorControl._get_display_name_linux()
-                        brightness = value / 100
-                        subprocess.run(['xrandr', '--output', display, '--brightness', str(brightness)], 
-                                      capture_output=True)
-            else:
-                # Fallback para xrandr (ajusta gamma, não brilho real)
-                display = MonitorControl._get_display_name_linux()
-                brightness = max(0.1, min(3.0, value / 50))  # Converter para escala do xrandr
-                subprocess.run(['xrandr', '--output', display, '--brightness', str(brightness)], 
-                              capture_output=True)
-        except Exception as e:
-            print(f"Erro ao ajustar brilho no Linux: {e}")
-    
-    @staticmethod
-    def _set_brightness_macos(value):
-        """Define brilho no macOS"""
-        try:
-            brightness = max(0, min(100, value))
-            script = f'''
-            tell application "System Events"
-                set brightness to {brightness / 100}
-            end tell
-            '''
-            subprocess.run(['osascript', '-e', script], capture_output=True)
-        except:
-            print("Não foi possível ajustar o brilho no macOS")
-    
-    @staticmethod
-    def _get_display_name_linux():
-        """Obtém o nome do display no Linux"""
-        try:
-            result = subprocess.run(['xrandr', '--query'], capture_output=True, text=True)
-            lines = result.stdout.split('\n')
-            for line in lines:
-                if ' connected' in line:
-                    return line.split()[0]
-        except:
+            if not IsWindowVisible(hwnd): return True
+            length = GetWindowTextLengthW(hwnd)
+            if length == 0: return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+            if "rust" in title.lower():
+                found.value = hwnd
+                return False
+        except Exception:
             pass
-        return "eDP-1"  # Valor padrão comum
-    
-    @staticmethod
-    def set_contrast(value):
-        """Define o contraste do monitor"""
-        os_type = MonitorControl.get_os()
-        try:
-            if os_type == "Linux":
-                # No Linux, usa xgamma para ajustar contraste
-                gamma = 1.0 + (value - 50) / 100  # Converter para escala do gamma
-                subprocess.run(['xgamma', '-gamma', str(gamma)], capture_output=True)
-            else:
-                # Windows/macOS - mensagem informativa
-                print(f"Ajuste o contraste para {value}% manualmente nas configurações do monitor")
-            return True
-        except Exception as e:
-            print(f"Erro ao ajustar contraste: {e}")
-            return False
-    
-    @staticmethod
-    def set_night_mode(enabled):
-        """Ativa/desativa o modo noturno"""
-        os_type = MonitorControl.get_os()
-        try:
-            if os_type == "Linux":
-                if enabled:
-                    subprocess.run(['redshift', '-O', '4500'], capture_output=True)
-                else:
-                    subprocess.run(['redshift', '-x'], capture_output=True)
-            elif os_type == "Windows":
-                if enabled:
-                    subprocess.run(['reg', 'add', 
-                                   'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default$windows.data.bluelightreduction.bluelightreductionstate', 
-                                   '/v', 'Data', '/t', 'REG_BINARY', '/d', '0250000000000000', '/f'], 
-                                  capture_output=True)
-                else:
-                    subprocess.run(['reg', 'add', 
-                                   'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\default$windows.data.bluelightreduction.bluelightreductionstate', 
-                                   '/v', 'Data', '/t', 'REG_BINARY', '/d', '0200000000000000', '/f'], 
-                                  capture_output=True)
-            elif os_type == "Darwin":
-                if enabled:
-                    subprocess.run(['osascript', '-e', 
-                                  'tell application "System Events" to tell appearance preferences to set dark mode to true'], 
-                                  capture_output=True)
-                else:
-                    subprocess.run(['osascript', '-e', 
-                                  'tell application "System Events" to tell appearance preferences to set dark mode to false'], 
-                                  capture_output=True)
-            return True
-        except Exception as e:
-            print(f"Erro ao ajustar modo noturno: {e}")
-            return False
-    
-    @staticmethod
-    def set_gamma(value):
-        """Ajusta o gamma da tela"""
-        os_type = MonitorControl.get_os()
-        try:
-            if os_type == "Linux":
-                gamma = value / 50  # Converter para escala do xgamma
-                subprocess.run(['xgamma', '-gamma', str(gamma)], capture_output=True)
-            else:
-                print(f"Ajuste gamma para {value}% manualmente se disponível")
-            return True
-        except Exception as e:
-            print(f"Erro ao ajustar gamma: {e}")
-            return False
+        return True
+    EnumWindows(WNDENUMPROC(_cb), 0)
+    return ctypes.c_void_p(found.value).value
 
-class Crosshair(QWidget):
-    def __init__(self, config):
+# =========================
+# Estado
+# =========================
+class AppState:
+    def __init__(self):
+        self.current_profile="default"
+        self.use_overlay=False
+        self.bright_pct=self.contr_pct=self.gamma_pct=self.sat_pct=50
+        self.daymax=False
+        self.clarity=1.2
+        self.filter_type="Clarity"
+        self.overlay_alpha=70
+        self.overlay_suspended=False
+        self.force_overlay_fullscreen=True
+        self.attach_to_rust=True
+        self.rust_hwnd=None
+        self.auto_hide_panel=True  # painel não rouba foco
+
+# =========================
+# Overlay (1 passe), click-through
+# =========================
+class FilterOverlay(WinNativePassThrough, QWidget):
+    def __init__(self, state: AppState):
         super().__init__()
-        self.config = config
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.state=state
+        self.mode='off'; self.alpha_override=None; self.filter_type="Clarity"
+        self.setWindowFlags(Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|Qt.Tool|Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.resize(200, 200)
+        self.setContextMenuPolicy(Qt.NoContextMenu)
+        if hasattr(Qt,"WindowTransparentForInput"):
+            self.setWindowFlag(Qt.WindowTransparentForInput, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        _make_click_through(int(self.winId()))
+        self.guard = QTimer(self); self.guard.setInterval(500); self.guard.timeout.connect(self._guard_tick); self.guard.start()
+        self.track = QTimer(self); self.track.setInterval(250); self.track.timeout.connect(self._track_target); self.track.start()
+        self._attach_primary_geometry()
+
+    def _attach_primary_geometry(self):
+        g=QApplication.primaryScreen().geometry()
+        self.setGeometry(QRect(g.left(),g.top(),g.width(),g.height()))
+        if self.mode!='off' and not self.state.overlay_suspended: self._show_noactivate()
+        else: self.hide()
+
+    def _attach_rust_geometry(self):
+        hwnd = self.state.rust_hwnd
+        if not hwnd:
+            self._attach_primary_geometry(); return
+        rect = wintypes.RECT()
+        if not GetWindowRect(hwnd, ctypes.byref(rect)):
+            self._attach_primary_geometry(); return
+        # Fallback: se janela for pequena (launcher/splash), usa tela toda
+        pg = QApplication.primaryScreen().geometry()
+        sw, sh = pg.width(), pg.height()
+        w = rect.right-rect.left; h = rect.bottom-rect.top
+        if w < int(sw*0.7) or h < int(sh*0.7):
+            self._attach_primary_geometry(); return
+        self.setGeometry(QRect(rect.left, rect.top, w, h))
+        if self.mode!='off' and not self.state.overlay_suspended: self._show_noactivate()
+
+    def _show_noactivate(self):
         self.show()
-        self.update_position()
+        SetWindowPos(int(self.winId()), HWND_TOPMOST, 0,0,0,0,
+                     SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW)
 
-    def update_position(self):
-        screen = QApplication.primaryScreen().geometry()
-        x = screen.center().x() - self.width() // 2
-        y = screen.center().y() - self.height() // 2
-        self.move(x, y)
+    def _track_target(self):
+        if self.state.attach_to_rust:
+            if not self.state.rust_hwnd or not IsWindow(self.state.rust_hwnd):
+                self.state.rust_hwnd = _find_rust_hwnd()
+            self._attach_rust_geometry()
+        else:
+            self._attach_primary_geometry()
 
-    def set_config(self, config):
-        self.config = config
+    def set_mode(self, mode, alpha=None, filter_type=None):
+        mode=mode.lower()
+        if mode not in ('day','bright','off'): mode='off'
+        self.mode=mode
+        if filter_type: self.filter_type=filter_type
+        self.alpha_override=alpha
+        if self.mode=='off': self.hide()
+        else:
+            if self.state.attach_to_rust and self.state.rust_hwnd: self._attach_rust_geometry()
+            else: self._attach_primary_geometry()
+            self._show_noactivate()
         self.update()
 
-    def paintEvent(self, event):
-        self.update_position()
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        center = self.rect().center()
+    def _guard_tick(self):
+        if self.state.force_overlay_fullscreen:
+            if self.mode!='off': self._show_noactivate()
+            return
+        if _is_foreground_fullscreen_primary() and self.mode!='off' and not self.state.overlay_suspended:
+            self.state.overlay_suspended=True; self.hide()
+        elif (not _is_foreground_fullscreen_primary()) and self.state.overlay_suspended:
+            self.state.overlay_suspended=False; self._show_noactivate()
 
-        size = self.config.get("size", 10)
-        gap = self.config.get("gap", 4)
-        thickness = self.config.get("thickness", 2)
-        opacity = self.config.get("opacity", 100)
-        style = self.config.get("style", "Clássico")
-        color = QColor(self.config.get("color", "#00FF00"))
-        color.setAlphaF(opacity / 100)
+    def set_strength(self, alpha):
+        self.alpha_override=max(0,min(255,int(alpha)))
+        if self.mode!='off' and not self.state.overlay_suspended: self.update()
 
-        pen_main = QPen(color, thickness)
-        pen_shadow = QPen(QColor(0, 0, 0, 160), thickness + 1)
+    def get_strength(self, default=70):
+        return int(self.alpha_override) if self.alpha_override is not None else default
 
-        def draw_line(x1, y1, x2, y2):
-            painter.setPen(pen_shadow)
-            painter.drawLine(x1, y1, x2, y2)
-            painter.setPen(pen_main)
-            painter.drawLine(x1, y1, x2, y2)
+    def _color_for_filter(self):
+        if self.filter_type == "NVG Verde":   return 210,255,210
+        if self.filter_type == "Cinza":       return 240,240,240
+        if self.filter_type == "Frio (Lua)":  return 220,235,255
+        return 255,244,220  # Clarity
 
-        if style == "Clássico":
-            draw_line(center.x(), center.y() - gap - size, center.x(), center.y() - gap)
-            draw_line(center.x(), center.y() + gap, center.x(), center.y() + gap + size)
-            draw_line(center.x() - gap - size, center.y(), center.x() - gap, center.y())
-            draw_line(center.x() + gap, center.y(), center.x() + gap + size, center.y())
+    def paintEvent(self, ev):
+        if self.mode=='off' or self.state.overlay_suspended: return
+        p=QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setCompositionMode(QPainter.CompositionMode_Screen)
+        r,g,b = self._color_for_filter()
+        a = self.get_strength()
+        p.fillRect(self.rect(), QColor(r,g,b, a))
+        p.end()
 
-        elif style == "Círculo":
-            painter.setPen(pen_shadow)
-            painter.drawEllipse(center, size + 1, size + 1)
-            painter.setPen(pen_main)
-            painter.drawEllipse(center, size, size)
+# =========================
+# Controle (LUT + overlay)
+# =========================
+class MonitorControl:
+    @staticmethod
+    def _apply_lut_from_state(overlay: FilterOverlay, st: AppState):
+        if is_rdp_session():
+            st.use_overlay = (st.current_profile != "default")
+            overlay.set_mode('day' if st.current_profile=='day' else ('bright' if st.current_profile=='bright' else 'off'),
+                             alpha=st.overlay_alpha, filter_type=st.filter_type)
+            return False
+        disable_windows_night_light()
+        ramp=_build_lut(st.bright_pct, st.contr_pct, st.gamma_pct, st.sat_pct,
+                        st.daymax, clarity=st.clarity, filter_type=st.filter_type)
+        ok=_apply_lut_to_primary(ramp)
+        st.use_overlay=not ok
+        if ok: overlay.set_mode('off')
+        else:
+            if st.current_profile=='default': overlay.set_mode('off')
+            else: overlay.set_mode('day', alpha=st.overlay_alpha, filter_type=st.filter_type)
+        return ok
 
-        elif style == "Ponto":
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(color)
-            painter.drawEllipse(center, size, size)
+    @staticmethod
+    def apply_profile(profile: str, overlay: FilterOverlay, st: AppState):
+        st.current_profile=profile
+        if profile=="day":
+            st.bright_pct, st.contr_pct, st.gamma_pct, st.sat_pct = 84, 70, 90, 58
+            st.daymax=True
+        elif profile=="bright":
+            st.bright_pct, st.contr_pct, st.gamma_pct, st.sat_pct = 100, 50, 50, 50
+            st.daymax=False
+        else:
+            st.bright_pct = st.contr_pct = st.gamma_pct = st.sat_pct = 50
+            st.daymax=False
+        return MonitorControl._apply_lut_from_state(overlay, st)
 
-        elif style == "Retícula":
-            draw_line(center.x(), center.y() - gap - size, center.x(), center.y() - gap)
-            draw_line(center.x(), center.y() + gap, center.x(), center.y() + gap + size)
-            draw_line(center.x() - gap - size, center.y(), center.x() - gap, center.y())
-            draw_line(center.x() + gap, center.y(), center.x() + gap + size, center.y())
+    @staticmethod
+    def bump_brightness(delta_steps: int, overlay: FilterOverlay, st: AppState):
+        if st.current_profile=="default" and not st.use_overlay:
+            st.current_profile="bright"
+        if not st.use_overlay:
+            st.bright_pct=max(0,min(100, st.bright_pct + 5*delta_steps))
+            return MonitorControl._apply_lut_from_state(overlay, st)
+        else:
+            st.overlay_alpha=max(0,min(255, st.overlay_alpha + 10*delta_steps))
+            overlay.set_mode('day', alpha=st.overlay_alpha, filter_type=st.filter_type)
+            return True
 
-
-class SettingsWindow(QWidget):
-    def __init__(self, crosshair_widget):
+# =========================
+# Mira (click-through)
+# =========================
+class Crosshair(WinNativePassThrough, QWidget):
+    def __init__(self, config):
         super().__init__()
-        self.crosshair_widget = crosshair_widget
-        self.monitor_config = load_monitor_config()
-        self.setWindowTitle("Mira Personalizada • Multiplataforma")
-        self.setFixedSize(600, 700)
-        self.set_dark_theme()
-        self.init_ui()
-        
-        # Mostrar informações do sistema
-        self.show_system_info()
+        self.config=config
+        self.setWindowFlags(Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|Qt.Tool|Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setContextMenuPolicy(Qt.NoContextMenu)
+        self.resize(200,200); self.show()
+        self.update_position()
+        try: QApplication.primaryScreen().geometryChanged.connect(lambda *_: self.update_position())
+        except Exception: pass
+        _make_click_through(int(self.winId()))
 
-    def show_system_info(self):
-        """Mostra informações do sistema operacional"""
-        os_name = platform.system()
-        os_info = f"Sistema: {os_name}"
-        if os_name == "Linux":
-            try:
-                distro = platform.freedesktop_os_release().get('PRETTY_NAME', 'Linux')
-                os_info = f"Sistema: {distro}"
-            except:
-                pass
-        print(os_info)
+    def update_position(self):
+        g=QApplication.primaryScreen().geometry()
+        self.move(g.center().x()-self.width()//2, g.center().y()-self.height()//2)
+
+    def set_config(self, c): self.config=c; self.update()
+
+    def paintEvent(self, e):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        c=self.rect().center()
+        size=self.config.get("size",10); gap=self.config.get("gap",4)
+        thick=self.config.get("thickness",2); op=self.config.get("opacity",100)
+        style=self.config.get("style","Clássico"); color=QColor(self.config.get("color","#00FF00"))
+        color.setAlphaF(op/100.0)
+        pen=QPen(color,thick); shadow=QPen(QColor(0,0,0,160), thick+1)
+        def ln(x1,y1,x2,y2): p.setPen(shadow); p.drawLine(x1,y1,x2,y2); p.setPen(pen); p.drawLine(x1,y1,x2,y2)
+        if style=="Clássico":
+            ln(c.x(),c.y()-gap-size, c.x(),c.y()-gap); ln(c.x(),c.y()+gap, c.x(),c.y()+gap+size)
+            ln(c.x()-gap-size,c.y(), c.x()-gap,c.y()); ln(c.x()+gap,c.y(), c.x()+gap+size,c.y())
+        elif style=="Círculo":
+            p.setPen(shadow); p.drawEllipse(c,size+1,size+1); p.setPen(pen); p.drawEllipse(c,size,size)
+        elif style=="Ponto":
+            p.setPen(Qt.NoPen); p.setBrush(color); p.drawEllipse(c,size,size)
+        else:
+            ln(c.x(),c.y()-gap-size, c.x(),c.y()-gap); ln(c.x(),c.y()+gap, c.x(),c.y()+gap+size)
+            ln(c.x()-gap-size,c.y(), c.x()-gap,c.y()); ln(c.x()+gap,c.y(), c.x()+gap+size,c.y())
+        p.end()
+
+# =========================
+# UI
+# =========================
+class SettingsWindow(QWidget):
+    def __init__(self, crosshair_widget, overlay: FilterOverlay, state: AppState):
+        super().__init__()
+        self.crosshair=crosshair_widget; self.overlay=overlay; self.state=state
+        self.setWindowTitle("Mira + Noite → Dia (Filtro)") 
+        self.resize(800,660); self.set_dark_theme(); self.init_ui()
+        self._focus_guard = QTimer(self); self._focus_guard.setInterval(300)
+        self._focus_guard.timeout.connect(self._focus_guard_tick); self._focus_guard.start()
+
+    def _hero(self,t,sub):
+        b=QFrame(); b.setObjectName("Hero"); v=QVBoxLayout(b)
+        T=QLabel(t); T.setAlignment(Qt.AlignCenter); T.setObjectName("HeroTitle")
+        S=QLabel(sub); S.setAlignment(Qt.AlignCenter); S.setObjectName("HeroSub")
+        v.addWidget(T); v.addWidget(S); return b
 
     def init_ui(self):
-        layout = QVBoxLayout()
-        
-        # Título com informação do OS
-        os_name = platform.system()
-        title_label = QLabel(f"Mira Personalizada - {os_name}")
-        title_label.setStyleSheet("color: #aa55ff; font-weight: bold; font-size: 16px;")
-        title_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title_label)
-        
-        # Criar abas
-        tabs = QTabWidget()
-        
-        # Aba de Controles de Monitor
-        monitor_tab = QWidget()
-        monitor_layout = QVBoxLayout()
-        monitor_tab.setLayout(monitor_layout)
-        
-        # Informações do sistema
-        info_label = QLabel(self.get_os_specific_info())
-        info_label.setStyleSheet("color: #ff7700; background-color: #222; padding: 5px;")
-        info_label.setWordWrap(True)
-        monitor_layout.addWidget(info_label)
-        
-        # Grupo de controles de brilho
-        brightness_group = QGroupBox("CONTROLES DE BRILHO")
-        brightness_group.setStyleSheet("QGroupBox { color: yellow; font-weight: bold; }")
-        brightness_layout = QVBoxLayout()
-        
-        self.brightness_slider = self._create_monitor_slider(brightness_layout, "BRILHO", 0, 100, 
-                                                           self.monitor_config.get("brightness", 50),
-                                                           self.apply_brightness)
-        brightness_group.setLayout(brightness_layout)
-        monitor_layout.addWidget(brightness_group)
-        
-        # Grupo de controles de contraste
-        contrast_group = QGroupBox("CONTROLES DE CONTRASTE")
-        contrast_group.setStyleSheet("QGroupBox { color: cyan; font-weight: bold; }")
-        contrast_layout = QVBoxLayout()
-        
-        self.contrast_slider = self._create_monitor_slider(contrast_layout, "CONTRASTE", 0, 100,
-                                                         self.monitor_config.get("contrast", 50),
-                                                         self.apply_contrast)
-        contrast_group.setLayout(contrast_layout)
-        monitor_layout.addWidget(contrast_group)
-        
-        # Grupo de controles de gamma
-        gamma_group = QGroupBox("CONTROLES DE GAMMA")
-        gamma_group.setStyleSheet("QGroupBox { color: #ff77ff; font-weight: bold; }")
-        gamma_layout = QVBoxLayout()
-        
-        self.gamma_slider = self._create_monitor_slider(gamma_layout, "GAMMA", 0, 100,
-                                                      self.monitor_config.get("gamma", 50),
-                                                      self.apply_gamma)
-        gamma_group.setLayout(gamma_layout)
-        monitor_layout.addWidget(gamma_group)
-        
-        # Modo noturno
-        night_mode_group = QGroupBox("MODO NOTURNO")
-        night_mode_group.setStyleSheet("QGroupBox { color: #ff7700; font-weight: bold; }")
-        night_mode_layout = QVBoxLayout()
-        
-        self.night_mode_checkbox = QCheckBox("Ativar Modo Noturno (Reduz Luz Azul)")
-        self.night_mode_checkbox.setChecked(self.monitor_config.get("night_mode", False))
-        self.night_mode_checkbox.stateChanged.connect(self.toggle_night_mode)
-        night_mode_layout.addWidget(self.night_mode_checkbox)
-        
-        night_mode_group.setLayout(night_mode_layout)
-        monitor_layout.addWidget(night_mode_group)
-        
-        # Botões de preset
-        preset_group = QGroupBox("PRESETS RÁPIDOS")
-        preset_group.setStyleSheet("QGroupBox { color: #aa55ff; font-weight: bold; }")
-        preset_layout = QHBoxLayout()
-        
-        night_preset_btn = QPushButton("Preset Noite")
-        night_preset_btn.setStyleSheet("QPushButton { background-color: #aa55ff; color: white; }")
-        night_preset_btn.clicked.connect(self.apply_night_preset)
-        preset_layout.addWidget(night_preset_btn)
-        
-        default_preset_btn = QPushButton("Padrão")
-        default_preset_btn.setStyleSheet("QPushButton { background-color: #333; color: white; }")
-        default_preset_btn.clicked.connect(self.apply_default_preset)
-        preset_layout.addWidget(default_preset_btn)
-        
-        preset_group.setLayout(preset_layout)
-        monitor_layout.addWidget(preset_group)
-        
-        tabs.addTab(monitor_tab, "Monitor")
-        
-        # Aba da Mira
-        crosshair_tab = QWidget()
-        crosshair_layout = QVBoxLayout()
-        crosshair_tab.setLayout(crosshair_layout)
-        
-        self.size_input = self._create_slider(crosshair_layout, "Tamanho", 1, 100, "size")
-        self.gap_input = self._create_slider(crosshair_layout, "Espaçamento (Gap)", 0, 50, "gap")
-        self.thickness_input = self._create_slider(crosshair_layout, "Espessura", 1, 10, "thickness")
-        self.opacity_input = self._create_slider(crosshair_layout, "Opacidade", 10, 100, "opacity")
+        root=QVBoxLayout(self)
+        root.addWidget(self._hero("Noite → Dia (Filtro leve p/ Rust)",
+                                  "LUT (zero custo) quando possível; overlay 1-passe quando necessário. Click-through total."))
 
-        color_button = QPushButton("Escolher Cor da Mira")
-        color_button.clicked.connect(self.choose_color)
-        crosshair_layout.addWidget(color_button)
+        # Filtro
+        card=QGroupBox("Filtro"); card.setObjectName("Card"); v=QVBoxLayout(card)
+        rowf=QHBoxLayout()
+        rowf.addWidget(QLabel("Tipo:"))
+        self.filter_box=QComboBox(); self.filter_box.addItems(["Clarity","NVG Verde","Cinza","Frio (Lua)"])
+        self.filter_box.currentTextChanged.connect(self._on_filter_changed); rowf.addWidget(self.filter_box)
+        rowf.addWidget(QLabel("Força:"))
+        self.clarity_slider=QSlider(Qt.Horizontal); self.clarity_slider.setMinimum(50); self.clarity_slider.setMaximum(150)
+        self.clarity_slider.setValue(120); self.clarity_slider.valueChanged.connect(self._on_filter_changed)
+        rowf.addWidget(self.clarity_slider); v.addLayout(rowf)
 
-        style_layout = QHBoxLayout()
-        style_label = QLabel("Formato:")
-        style_label.setStyleSheet("color: white;")
-        style_layout.addWidget(style_label)
+        # Perfis & brilho
+        card2=QGroupBox("Perfis, Brilho e Tela Cheia"); card2.setObjectName("Card"); v2=QVBoxLayout(card2)
+        r1=QHBoxLayout()
+        b_day=QPushButton("🌞  Noite → Dia"); b_day.setObjectName("Primary")
+        b_bri=QPushButton("💡  Brilho Máximo"); b_bri.setObjectName("Success")
+        b_def=QPushButton("♻️  Padrão"); b_def.setObjectName("Muted")
+        for b in (b_day,b_bri,b_def):
+            b.setMinimumHeight(46); b.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Fixed); r1.addWidget(b)
+        v2.addLayout(r1)
 
-        self.style_box = QComboBox()
-        self.style_box.addItems(["Clássico", "Círculo", "Ponto", "Retícula"])
-        self.style_box.setCurrentText(self.crosshair_widget.config.get("style", "Clássico"))
-        self.style_box.currentTextChanged.connect(self.apply_crosshair_settings)
-        style_layout.addWidget(self.style_box)
-        crosshair_layout.addLayout(style_layout)
-        
-        tabs.addTab(crosshair_tab, "Mira")
-        
-        layout.addWidget(tabs)
-        
-        # Botão de sobre
-        about_button = QPushButton("Sobre e Ajuda")
-        about_button.clicked.connect(self.open_about)
-        layout.addWidget(about_button)
+        r2=QHBoxLayout()
+        b_up=QPushButton("🔺 Brilho +"); b_dn=QPushButton("🔻 Brilho −")
+        b_fix=QPushButton("🔧 Night Light OFF")
+        for b in (b_up,b_dn,b_fix):
+            b.setMinimumHeight(42); b.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Fixed); r2.addWidget(b)
+        v2.addLayout(r2)
 
-        self.setLayout(layout)
-        
-        # Aplicar configurações iniciais
-        self.apply_monitor_settings()
+        r3=QHBoxLayout()
+        r3.addWidget(QLabel("Intensidade (overlay fallback):"))
+        self.ov_slider=QSlider(Qt.Horizontal); self.ov_slider.setMinimum(0); self.ov_slider.setMaximum(255)
+        self.ov_slider.setValue(70); self.ov_slider.valueChanged.connect(self._overlay_strength_changed)
+        r3.addWidget(self.ov_slider); v2.addLayout(r3)
 
-    def get_os_specific_info(self):
-        """Retorna informações específicas do sistema operacional"""
-        os_name = platform.system()
-        if os_name == "Linux":
-            return "Linux: Use os controles deslizantes para ajustar brilho, contraste e gamma. Certifique-se de ter xgamma e xrandr instalados."
-        elif os_name == "Windows":
-            return "Windows: Alguns controles podem requerer ajuste manual nas configurações de display."
-        elif os_name == "Darwin":
-            return "macOS: Controles funcionam via AppleScript. Pode precisar de permissões."
+        self.cb_force = QCheckBox("Manter filtro em tela cheia (forçar) — pode não aparecer no exclusivo real")
+        self.cb_force.setChecked(True); self.cb_force.stateChanged.connect(self._toggle_force_fs); v2.addWidget(self.cb_force)
+
+        self.cb_attach = QCheckBox("Anexar filtro à janela do Rust")
+        self.cb_attach.setChecked(True); self.cb_attach.stateChanged.connect(self._toggle_attach_rust); v2.addWidget(self.cb_attach)
+
+        self.cb_autohide = QCheckBox("Ocultar este painel quando o Rust estiver em foco (recomendado)")
+        self.cb_autohide.setChecked(True)
+        self.cb_autohide.stateChanged.connect(lambda s: setattr(self.state, "auto_hide_panel", s==Qt.Checked))
+        v2.addWidget(self.cb_autohide)
+
+        self.status=QLabel("Pronto."); self.status.setObjectName("Status"); v2.addWidget(self.status)
+
+        b_day.clicked.connect(lambda: self._apply("day"))
+        b_bri.clicked.connect(lambda: self._apply("bright"))
+        b_def.clicked.connect(lambda: self._apply("default"))
+        b_up.clicked.connect(lambda: self._bump(+1))
+        b_dn.clicked.connect(lambda: self._bump(-1))
+        b_fix.clicked.connect(self._fix)
+
+        root.addWidget(card); root.addWidget(card2)
+
+        # Mira
+        mira=QGroupBox("Mira"); mira.setObjectName("Card"); ml=QVBoxLayout(mira)
+        self.size_s=self._add_slider(ml,"Tamanho",1,100,"size")
+        self.gap_s=self._add_slider(ml,"Espaçamento (Gap)",0,50,"gap")
+        self.thick_s=self._add_slider(ml,"Espessura",1,10,"thickness")
+        self.opac_s=self._add_slider(ml,"Opacidade",10,100,"opacity")
+        bcol=QPushButton("Cor da Mira…"); bcol.clicked.connect(self.choose_color); ml.addWidget(bcol)
+        rowfmt=QHBoxLayout(); rowfmt.addWidget(QLabel("Formato:"))
+        self.style_box=QComboBox(); self.style_box.addItems(["Clássico","Círculo","Ponto","Retícula"])
+        self.style_box.setCurrentText(self.crosshair.config.get("style","Clássico"))
+        self.style_box.currentTextChanged.connect(self.apply_crosshair)
+        rowfmt.addWidget(self.style_box); ml.addLayout(rowfmt)
+        root.addWidget(mira); root.addStretch(1)
+
+        if is_rdp_session():
+            QMessageBox.information(self,"Aviso","Sessão RDP: LUT não funciona. Usaremos overlay (1 passe).")
+
+        self._on_filter_changed()
+
+    # ---- auto-hide painel para não soltar o mouse do jogo
+    def _focus_guard_tick(self):
+        if not self.state.auto_hide_panel: return
+        rust = self.overlay.state.rust_hwnd or _find_rust_hwnd()
+        fg = GetForegroundWindow()
+        if rust and fg == rust:
+            if self.isVisible(): self.hide()
         else:
-            return f"{os_name}: Controles podem ter funcionalidade limitada."
+            if not self.isVisible(): self.show()
 
-    def _create_slider(self, layout, label_text, min_val, max_val, config_key):
-        label = QLabel(label_text)
-        label.setStyleSheet("color: white;")
-        layout.addWidget(label)
+    # toggles
+    def _toggle_force_fs(self, s):
+        self.state.force_overlay_fullscreen = (s == Qt.Checked)
+        if self.overlay.mode!='off': self.overlay._show_noactivate()
 
-        slider = QSlider(Qt.Horizontal)
-        slider.setMinimum(min_val)
-        slider.setMaximum(max_val)
-        slider.setValue(self.crosshair_widget.config.get(config_key, min_val))
-        slider.valueChanged.connect(self.apply_crosshair_settings)
-        layout.addWidget(slider)
+    def _toggle_attach_rust(self, s):
+        self.state.attach_to_rust = (s == Qt.Checked)
+        if not self.state.attach_to_rust:
+            self.state.rust_hwnd = None
+        if self.overlay.mode!='off': self.overlay._show_noactivate()
 
-        setattr(self, f"{config_key}_slider", slider)
-        return slider
-    
-    def _create_monitor_slider(self, layout, label_text, min_val, max_val, default_val, callback):
-        label = QLabel(f"{label_text}: {default_val}%")
-        label.setStyleSheet("color: white;")
-        layout.addWidget(label)
+    # filtro
+    def _on_filter_changed(self):
+        self.state.filter_type = self.filter_box.currentText()
+        self.state.clarity = self.clarity_slider.value()/100.0
+        if self.overlay.mode!='off':
+            self.overlay.set_mode('day', alpha=self.state.overlay_alpha, filter_type=self.state.filter_type)
 
-        slider = QSlider(Qt.Horizontal)
-        slider.setMinimum(min_val)
-        slider.setMaximum(max_val)
-        slider.setValue(default_val)
-        slider.valueChanged.connect(lambda value: self._on_monitor_slider_change(value, label, label_text, callback))
-        layout.addWidget(slider)
+    def _overlay_strength_changed(self, v):
+        self.state.overlay_alpha = v
+        if self.overlay.mode!='off':
+            self.overlay.set_strength(v)
+            self.status.setText(f"Overlay ativo ({v}/255). Se clarear demais, reduza.")
 
-        return slider
-    
-    def _on_monitor_slider_change(self, value, label, label_text, callback):
-        label.setText(f"{label_text}: {value}%")
-        callback(value)
+    # perfis
+    def _fix(self):
+        ok=disable_windows_night_light()
+        QMessageBox.information(self,"Night Light","Night Light desativado." if ok else "Não foi possível alterar.")
+        self.status.setText("⚙️ Ajuste aplicado. Tente o perfil novamente.")
+
+    def _apply(self, name):
+        ok=MonitorControl.apply_profile(name, self.overlay, self.state)
+        tag={"day":"Noite → Dia","bright":"Brilho Máximo","default":"Padrão"}[name]
+        extra=""
+        if not ok: extra=" — overlay ativo (fallback)"
+        self.status.setText("✅ "+tag+extra)
+        if self.overlay.mode!='off':
+            self.ov_slider.setValue(self.overlay.get_strength())
+
+    def _bump(self, d):
+        MonitorControl.bump_brightness(d, self.overlay, self.state)
+        if self.state.use_overlay:
+            v=self.overlay.get_strength(); self.ov_slider.setValue(v)
+            self.status.setText(f"✅ Brilho (overlay): {v}/255")
+        else:
+            self.status.setText(f"✅ Brilho (LUT): {self.state.bright_pct}%")
+
+    # mira
+    def _add_slider(self, layout, label, mn, mx, key):
+        layout.addWidget(QLabel(label))
+        s=QSlider(Qt.Horizontal); s.setMinimum(mn); s.setMaximum(mx)
+        s.setValue(self.crosshair.config.get(key, mn)); s.valueChanged.connect(self.apply_crosshair)
+        layout.addWidget(s); setattr(self, f"{key}_slider", s); return s
 
     def choose_color(self):
-        dialog = QColorDialog(self)
-        dialog.setOption(QColorDialog.ShowAlphaChannel, False)
-        if dialog.exec_():
-            selected_color = dialog.selectedColor()
-            if selected_color.isValid():
-                self.crosshair_widget.config["color"] = selected_color.name()
-                self.apply_crosshair_settings()
+        dlg=QColorDialog(self); dlg.setOption(QColorDialog.ShowAlphaChannel, False)
+        if dlg.exec_():
+            c=dlg.selectedColor()
+            if c.isValid():
+                self.crosshair.config["color"]=c.name(); self.apply_crosshair()
 
-    def apply_crosshair_settings(self):
-        config = self.crosshair_widget.config
-        config["size"] = self.size_slider.value()
-        config["gap"] = self.gap_slider.value()
-        config["thickness"] = self.thickness_slider.value()
-        config["opacity"] = self.opacity_slider.value()
-        config["style"] = self.style_box.currentText()
-        self.crosshair_widget.set_config(config)
-        self.save_crosshair_config()
-    
-    def apply_brightness(self, value):
-        self.monitor_config["brightness"] = value
-        MonitorControl.set_brightness(value)
-        self.save_monitor_config()
-    
-    def apply_contrast(self, value):
-        self.monitor_config["contrast"] = value
-        MonitorControl.set_contrast(value)
-        self.save_monitor_config()
-    
-    def apply_gamma(self, value):
-        self.monitor_config["gamma"] = value
-        MonitorControl.set_gamma(value)
-        self.save_monitor_config()
-    
-    def toggle_night_mode(self, state):
-        enabled = state == Qt.Checked
-        self.monitor_config["night_mode"] = enabled
-        MonitorControl.set_night_mode(enabled)
-        self.save_monitor_config()
-    
-    def apply_night_preset(self):
-        """Preset recomendado para jogos noturnos"""
-        self.brightness_slider.setValue(70)
-        self.contrast_slider.setValue(80)
-        self.gamma_slider.setValue(60)
-        self.night_mode_checkbox.setChecked(True)
-    
-    def apply_default_preset(self):
-        """Restaura configurações padrão"""
-        self.brightness_slider.setValue(50)
-        self.contrast_slider.setValue(50)
-        self.gamma_slider.setValue(50)
-        self.night_mode_checkbox.setChecked(False)
-        # Aplicar as configurações
-        self.apply_brightness(50)
-        self.apply_contrast(50)
-        self.apply_gamma(50)
-        MonitorControl.set_night_mode(False)
-    
-    def apply_monitor_settings(self):
-        # Aplicar configurações salvas ao iniciar
-        MonitorControl.set_brightness(self.monitor_config.get("brightness", 50))
-        MonitorControl.set_contrast(self.monitor_config.get("contrast", 50))
-        MonitorControl.set_gamma(self.monitor_config.get("gamma", 50))
-        MonitorControl.set_night_mode(self.monitor_config.get("night_mode", False))
-
-    def save_crosshair_config(self):
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(self.crosshair_widget.config, f, indent=4)
-    
-    def save_monitor_config(self):
-        with open(MONITOR_CONFIG_FILE, "w") as f:
-            json.dump(self.monitor_config, f, indent=4)
-
-    def open_about(self):
-        os_name = platform.system()
-        message = f"""
-        Mira Overlay com Controles de Monitor - Multiplataforma
-        
-        Sistema: {os_name}
-        
-        Funcionalidades:
-        - Mira personalizável para jogos
-        - Controles de brilho, contraste e gamma
-        - Modo noturno para reduzir luz azul
-        - Presets para configurações rápidas
-        
-        Notas:
-        • No Linux: Instale x11-xserver-utils para funcionalidade completa
-        • No Windows: Alguns controles podem precisar de ajuste manual
-        • No macOS: Funcionalidade via AppleScript
-        
-        Desenvolvido para funcionar em Windows, Linux e macOS
-        """
-        
-        QMessageBox.information(self, "Sobre", message)
+    def apply_crosshair(self):
+        cfg=self.crosshair.config
+        cfg["size"]=self.size_s.value(); cfg["gap"]=self.gap_s.value()
+        cfg["thickness"]=self.thick_s.value(); cfg["opacity"]=self.opac_s.value()
+        cfg["style"]=self.style_box.currentText()
+        self.crosshair.set_config(cfg)
+        with open(CONFIG_FILE,"w",encoding="utf-8") as f: json.dump(cfg,f,indent=4,ensure_ascii=False)
 
     def set_dark_theme(self):
-        # Tema escuro simples
         self.setStyleSheet("""
-            QWidget {
-                background-color: #222222;
-                color: #ffffff;
-            }
-            QTabWidget::pane {
-                border: 1px solid #444444;
-            }
-            QTabBar::tab {
-                background: #333333;
-                color: #ffffff;
-                padding: 8px;
-            }
-            QTabBar::tab:selected {
-                background: #444444;
-                border-bottom: 2px solid #aa55ff;
-            }
-            QSlider::groove:horizontal {
-                border: 1px solid #444444;
-                height: 8px;
-                background: #333333;
-                margin: 2px 0;
-            }
-            QSlider::handle:horizontal {
-                background: #aa55ff;
-                border: 1px solid #777777;
-                width: 18px;
-                margin: -2px 0;
-                border-radius: 3px;
-            }
-            QCheckBox {
-                color: #ffffff;
-                spacing: 5px;
-            }
-            QCheckBox::indicator:unchecked {
-                border: 1px solid #777777;
-                background: #333333;
-            }
-            QCheckBox::indicator:checked {
-                border: 1px solid #777777;
-                background: #aa55ff;
-            }
+            QWidget { background:#0f1115; color:#e6e9ef; font-size:13px; }
+            #Hero { background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #1f2230, stop:1 #292d3e);
+                    border:1px solid #2b2f41; border-radius:12px; padding:16px; margin:8px; }
+            #HeroTitle { font-size:20px; font-weight:700; color:#a2d2ff; }
+            #HeroSub   { font-size:12px; color:#9aa3b2; }
+            #Card { border:1px solid #2b2f41; border-radius:12px; padding:12px; margin:8px; background:#171a21; }
+            #Status { color:#9dd79d; padding-top:6px; }
+            QPushButton { background:#2a2f3b; color:#e6e9ef; border:1px solid #394055;
+                          border-radius:8px; padding:10px 14px; }
+            QPushButton:hover  { background:#32394a; }
+            QPushButton:pressed{ background:#253042; }
+            QPushButton#Primary{ background:#f59e0b; color:#1a1a1a; border:1px solid #c27e07; }
+            QPushButton#Success{ background:#22c55e; color:#0b1b12; border:1px solid #1aa34b; }
+            QPushButton#Muted  { background:#64748b; color:#0b0f16; border:1px solid #566275; }
+            QGroupBox { font-weight:600; margin-top:12px; }
+            QGroupBox::title { subcontrol-origin: margin; left:12px; padding:0 4px; color:#aab4c8; }
+            QSlider::groove:horizontal { height:8px; background:#1f2532; border:1px solid #2b2f41; border-radius:4px; }
+            QSlider::handle:horizontal { background:#a2d2ff; border:1px solid #6aa3d6; width:18px; margin:-5px 0; border-radius:9px; }
         """)
 
-
+# =========================
+# Config
+# =========================
 def load_config():
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
-    return {
-        "size": 15,
-        "gap": 5,
-        "thickness": 3,
-        "opacity": 100,
-        "color": "#00FF00",
-        "style": "Clássico"
-    }
+        try:
+            with open(CONFIG_FILE,"r",encoding="utf-8") as f: return json.load(f)
+        except Exception: pass
+    return {"size":15,"gap":5,"thickness":3,"opacity":100,"color":"#00FF00","style":"Clássico"}
 
+# =========================
+# Main
+# =========================
+if __name__=="__main__":
+    ensure_admin()
+    # --- DPI (IMPORTANTÍSSIMO): faça antes do QApplication ---
+    if platform.system()=="Windows":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-Monitor DPI Aware
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
-def load_monitor_config():
-    if os.path.exists(MONITOR_CONFIG_FILE):
-        with open(MONITOR_CONFIG_FILE, "r") as f:
-            return json.load(f)
-    return {
-        "brightness": 50,
-        "contrast": 50,
-        "gamma": 50,
-        "night_mode": False
-    }
-
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    config = load_config()
-    crosshair = Crosshair(config)
-    settings = SettingsWindow(crosshair)
-
-    crosshair.show()
-    settings.show()
-
+    if platform.system()!="Windows":
+        print("Aviso: este app é para Windows.")
+    app=QApplication(sys.argv)
+    cfg=load_config()
+    state=AppState()
+    overlay=FilterOverlay(state)
+    crosshair=Crosshair(cfg)
+    settings=SettingsWindow(crosshair, overlay, state)
+    settings.show(); crosshair.show()
     sys.exit(app.exec_())

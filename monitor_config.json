@@ -1,6 +1,9 @@
 {
-    "brightness": 50,
-    "contrast": 50,
-    "night_mode": false,
-    "gamma": 50
+    "brightness": 85,
+    "contrast": 80,
+    "night_mode": true,
+    "gamma": 85,
+    "saturation": 60,
+    "nightmax": false,
+    "daymax": false
 }
