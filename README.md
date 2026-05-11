@@ -29,7 +29,7 @@ Simples, leve, com visual moderno e atualizações em tempo real.
 ## 🧰 Desenvolvido por
 
 **yrvt**  
-🔗 GitHub: [github.com/RevoltadoxDK](https://github.com/RevoltadoxDK)
+🔗 GitHub: [github.com/RevoltadoxDK](https://github.com/yRvtt)
 
 ---
 
